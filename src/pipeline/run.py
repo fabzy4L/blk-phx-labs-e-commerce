@@ -89,6 +89,14 @@ def init_db():
             cancellation_reason TEXT,
             occurred_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS fulfillment_jobs (
+            shopify_order_id TEXT PRIMARY KEY,
+            supliful_order_id TEXT,
+            status TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        );
     """)
     conn.commit()
     conn.close()
