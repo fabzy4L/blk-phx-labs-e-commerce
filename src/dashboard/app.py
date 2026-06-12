@@ -34,7 +34,7 @@ st.markdown("""
 
 # ── DATA LOADERS ──────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=300)  # refresh every 5 min
+@st.cache_data(ttl=300)
 def load_daily_metrics(days: int = 30) -> pd.DataFrame:
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -72,6 +72,49 @@ def load_customers() -> pd.DataFrame:
         return df
     except Exception:
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
+def load_cohort_metrics() -> pd.DataFrame:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql_query(
+            "SELECT * FROM cohort_metrics ORDER BY cohort_month, months_since_first_order",
+            conn
+        )
+        conn.close()
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
+def load_subscription_health() -> dict:
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+
+        cancellations = conn.execute(
+            """SELECT COUNT(*) FROM subscription_events
+               WHERE event_type = 'subscription_cancelled' AND occurred_at >= ?""",
+            (week_ago,),
+        ).fetchone()[0]
+
+        total_subscribers = conn.execute(
+            "SELECT COUNT(DISTINCT email) FROM subscription_events WHERE event_type = 'subscription_started'",
+        ).fetchone()[0]
+
+        conn.close()
+
+        rate = cancellations / total_subscribers if total_subscribers > 0 else 0.0
+        return {
+            "cancellations_this_week": cancellations,
+            "total_subscribers": total_subscribers,
+            "weekly_churn_rate": rate,
+            "alert": rate > 0.05,
+        }
+    except Exception:
+        return {"cancellations_this_week": 0, "total_subscribers": 0, "weekly_churn_rate": 0.0, "alert": False}
 
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
@@ -112,7 +155,7 @@ email_list = daily_df["email_list_size"].iloc[-1] if not daily_df.empty else 0
 total_customers = len(customers_df) if not customers_df.empty else 0
 
 with col1:
-    st.metric("Revenue", f"${total_revenue:,.2f}", delta=None)
+    st.metric("Revenue", f"${total_revenue:,.2f}")
 with col2:
     st.metric("Orders", f"{int(total_orders):,}")
 with col3:
@@ -216,6 +259,89 @@ if not customers_df.empty and "total_spent" in customers_df.columns:
 else:
     st.info("No customer data yet.")
 
+# ── COHORT RETENTION ──────────────────────────────────────────────────────────
+
+st.markdown("---")
+st.subheader("Cohort Retention")
+
+cohort_df = load_cohort_metrics()
+
+if not cohort_df.empty:
+    pivot = cohort_df.pivot(
+        index="cohort_month",
+        columns="months_since_first_order",
+        values="retention_rate",
+    )
+
+    z_vals = pivot.values * 100
+    text_vals = [
+        [f"{v:.0f}%" if not pd.isna(v) else "" for v in row]
+        for row in z_vals
+    ]
+
+    fig_cohort = go.Figure(data=go.Heatmap(
+        z=z_vals,
+        x=[f"Month +{c}" for c in pivot.columns],
+        y=pivot.index.tolist(),
+        colorscale="YlOrRd",
+        text=text_vals,
+        texttemplate="%{text}",
+        showscale=True,
+        colorbar=dict(title="Retention %"),
+    ))
+    fig_cohort.update_layout(
+        plot_bgcolor="#1a1a2e", paper_bgcolor="#0a0a0a",
+        font_color="#ffffff",
+        xaxis_title="Months Since First Order",
+        yaxis_title="Acquisition Cohort",
+    )
+    st.plotly_chart(fig_cohort, use_container_width=True)
+
+    # LTV by cohort at Month +1
+    m1 = cohort_df[cohort_df["months_since_first_order"] == 1]
+    if not m1.empty:
+        fig_ltv = px.bar(
+            m1, x="cohort_month", y="avg_ltv",
+            color_discrete_sequence=["#c8a96e"],
+            labels={"avg_ltv": "Avg LTV ($)", "cohort_month": "Cohort"},
+            title="Avg Cumulative LTV at Month +1 by Cohort",
+        )
+        fig_ltv.update_layout(
+            plot_bgcolor="#1a1a2e", paper_bgcolor="#0a0a0a",
+            font_color="#ffffff", showlegend=False,
+        )
+        st.plotly_chart(fig_ltv, use_container_width=True)
+else:
+    st.info("No cohort data yet. Run the pipeline to compute retention metrics.")
+
+# ── SUBSCRIPTION HEALTH ───────────────────────────────────────────────────────
+
+st.markdown("---")
+st.subheader("Subscription Health")
+
+sub_health = load_subscription_health()
+churn_rate_pct = sub_health["weekly_churn_rate"] * 100
+
+col_s1, col_s2, col_s3 = st.columns(3)
+with col_s1:
+    st.metric("Weekly Cancellations", sub_health["cancellations_this_week"])
+with col_s2:
+    st.metric("Total Subscribers", sub_health["total_subscribers"])
+with col_s3:
+    delta_color = "inverse" if sub_health["alert"] else "normal"
+    st.metric(
+        "Weekly Churn Rate",
+        f"{churn_rate_pct:.1f}%",
+        delta=f"{'⚠ ALERT' if sub_health['alert'] else 'OK'} (threshold: 5%)",
+        delta_color=delta_color,
+    )
+
+if sub_health["alert"]:
+    st.error(
+        f"Churn rate {churn_rate_pct:.1f}% exceeds 5% threshold. "
+        "Check Klaviyo win-back flow and review cancellation reasons."
+    )
+
 # ── PHASE TRIGGERS ────────────────────────────────────────────────────────────
 
 st.markdown("---")
@@ -231,5 +357,5 @@ try:
             st.warning(f"**{t['trigger'].upper()}**: {t['message']}")
     else:
         st.success("No phase triggers active. Continue Phase 1 validation.")
-except Exception as e:
-    st.info(f"Run the pipeline to check phase triggers.")
+except Exception:
+    st.info("Run the pipeline to check phase triggers.")

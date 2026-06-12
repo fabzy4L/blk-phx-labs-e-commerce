@@ -1,11 +1,12 @@
 """
 BLK PHX LABS — Unified Data Pipeline
 Pulls Shopify orders + Klaviyo profiles into local DB.
-Computes: revenue, AOV, LTV, churn rate, funnel conversion.
+Computes: revenue, AOV, LTV, cohort retention, churn signals.
 Runs on schedule (cron or APScheduler). Idempotent — safe to re-run.
 """
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -17,13 +18,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.store.shopify_client import get_orders, get_customers
-from src.automation.klaviyo_client import get_list_size
+from src.automation.klaviyo_client import get_list_size, track_event
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger(__name__)
 
 DB_PATH = "blkphx.db"
-CHURN_ALERT_THRESHOLD = 0.05  # 5% weekly cancellation rate
+CHURN_ALERT_THRESHOLD = 0.05  # 5% weekly subscription cancellation rate
+CHURN_INACTIVE_DAYS = int(os.getenv("CHURN_INACTIVE_DAYS", "45"))
 
 
 def get_db() -> sqlite3.Connection:
@@ -78,6 +80,15 @@ def init_db():
             computed_at TEXT,
             PRIMARY KEY (cohort_month, months_since_first_order)
         );
+
+        CREATE TABLE IF NOT EXISTS subscription_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            email TEXT NOT NULL,
+            product_title TEXT,
+            cancellation_reason TEXT,
+            occurred_at TEXT NOT NULL
+        );
     """)
     conn.commit()
     conn.close()
@@ -91,7 +102,6 @@ async def sync_orders(days_back: int = 7):
 
     conn = get_db()
     now = datetime.now(timezone.utc).isoformat()
-    import json
 
     for order in orders:
         conn.execute("""
@@ -117,8 +127,9 @@ async def sync_orders(days_back: int = 7):
 
 
 async def sync_customers(days_back: int = 30):
-    """Pull customers from Shopify into local DB."""
-    customers = await get_customers(limit=250)
+    """Pull customers updated in the last days_back days from Shopify into local DB."""
+    updated_since = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
+    customers = await get_customers(limit=250, updated_at_min=updated_since)
 
     conn = get_db()
     now = datetime.now(timezone.utc).isoformat()
@@ -166,7 +177,6 @@ async def compute_daily_metrics(date: str | None = None):
     )
     new_customers = new_customers_df["cnt"].iloc[0] if not new_customers_df.empty else 0
 
-    # Email list size from Klaviyo
     try:
         list_size = await get_list_size(os.getenv("KLAVIYO_LIST_ID_MAIN", ""))
     except Exception:
@@ -201,6 +211,174 @@ async def compute_daily_metrics(date: str | None = None):
     return metrics
 
 
+def compute_cohort_metrics():
+    """
+    Compute month-over-month cohort retention from order history.
+    Builds cohort_metrics table: for each acquisition-month cohort, tracks
+    how many customers ordered again in each subsequent month and their LTV.
+    """
+    conn = get_db()
+
+    orders_df = pd.read_sql_query(
+        """SELECT customer_email, created_at, total_price
+           FROM orders
+           WHERE financial_status = 'paid' AND customer_email != ''""",
+        conn,
+    )
+
+    if orders_df.empty:
+        conn.close()
+        logger.info("No orders available for cohort computation.")
+        return
+
+    orders_df["order_date"] = pd.to_datetime(orders_df["created_at"], utc=True)
+    orders_df["order_month"] = orders_df["order_date"].dt.to_period("M")
+
+    first_orders = (
+        orders_df.groupby("customer_email")["order_date"]
+        .min()
+        .reset_index()
+        .rename(columns={"order_date": "first_order_at"})
+    )
+    first_orders["cohort_month"] = first_orders["first_order_at"].dt.to_period("M")
+
+    merged = orders_df.merge(
+        first_orders[["customer_email", "cohort_month"]], on="customer_email"
+    )
+    merged["months_since_first_order"] = (
+        merged["order_month"].apply(lambda p: p.ordinal)
+        - merged["cohort_month"].apply(lambda p: p.ordinal)
+    )
+
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+
+    for cohort_month, cohort_group in merged.groupby("cohort_month"):
+        cohort_size = cohort_group["customer_email"].nunique()
+
+        for months_offset, period_group in cohort_group.groupby("months_since_first_order"):
+            retained = period_group["customer_email"].nunique()
+            retention_rate = retained / cohort_size if cohort_size > 0 else 0.0
+
+            cumulative = merged[
+                (merged["cohort_month"] == cohort_month)
+                & (merged["months_since_first_order"] <= months_offset)
+            ]
+            avg_ltv_val = cumulative.groupby("customer_email")["total_price"].sum().mean()
+
+            rows.append((
+                str(cohort_month),
+                int(months_offset),
+                cohort_size,
+                retained,
+                round(retention_rate, 4),
+                round(float(avg_ltv_val) if not pd.isna(avg_ltv_val) else 0.0, 2),
+                now,
+            ))
+
+    for row in rows:
+        conn.execute("""
+            INSERT OR REPLACE INTO cohort_metrics
+            (cohort_month, months_since_first_order, customers, retained,
+             retention_rate, avg_ltv, computed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, row)
+
+    conn.commit()
+    conn.close()
+    logger.info(f"Cohort metrics: {len(rows)} data points across {len(merged['cohort_month'].unique())} cohorts.")
+
+
+async def detect_churn_risks(days_inactive: int = CHURN_INACTIVE_DAYS) -> list[dict]:
+    """
+    Find customers with no paid order in the last days_inactive days.
+    Fires 'churn_risk_flagged' Klaviyo event to trigger win-back flow.
+    Uses orders table as source of truth — works even if customers table is incomplete.
+    """
+    conn = get_db()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_inactive)).isoformat()
+
+    at_risk_df = pd.read_sql_query(
+        """SELECT o.customer_email AS email,
+                  c.first_name,
+                  MAX(o.created_at) AS last_order_at,
+                  COUNT(o.id) AS orders_count,
+                  SUM(o.total_price) AS total_spent
+           FROM orders o
+           LEFT JOIN customers c ON o.customer_email = c.email
+           WHERE o.financial_status = 'paid' AND o.customer_email != ''
+           GROUP BY o.customer_email
+           HAVING last_order_at < ?""",
+        conn,
+        params=(cutoff,),
+    )
+    conn.close()
+
+    if at_risk_df.empty:
+        return []
+
+    flagged = []
+    for _, row in at_risk_df.iterrows():
+        try:
+            await track_event(
+                event_name="churn_risk_flagged",
+                email=row["email"],
+                properties={
+                    "last_order_at": row["last_order_at"],
+                    "days_inactive": days_inactive,
+                    "orders_count": int(row["orders_count"]),
+                    "total_spent": float(row["total_spent"]),
+                },
+            )
+            flagged.append({"email": row["email"], "last_order_at": row["last_order_at"]})
+        except Exception as e:
+            logger.error(f"Churn flag failed for {row['email']}: {e}")
+
+    if flagged:
+        logger.warning(f"Churn risk: {len(flagged)} customers flagged inactive for {days_inactive}+ days.")
+    return flagged
+
+
+def check_weekly_churn_rate() -> dict:
+    """
+    Compute subscription cancellation rate for the past 7 days.
+    Fires alert log if rate exceeds CHURN_ALERT_THRESHOLD (5%).
+    Requires subscription events to be logged by the Recharge webhook handler.
+    """
+    conn = get_db()
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+
+    cancellations = conn.execute(
+        """SELECT COUNT(*) FROM subscription_events
+           WHERE event_type = 'subscription_cancelled' AND occurred_at >= ?""",
+        (week_ago,),
+    ).fetchone()[0]
+
+    total_subscribers = conn.execute(
+        "SELECT COUNT(DISTINCT email) FROM subscription_events WHERE event_type = 'subscription_started'",
+    ).fetchone()[0]
+
+    conn.close()
+
+    rate = cancellations / total_subscribers if total_subscribers > 0 else 0.0
+    alert = rate > CHURN_ALERT_THRESHOLD
+
+    result = {
+        "cancellations_this_week": cancellations,
+        "total_subscribers": total_subscribers,
+        "weekly_churn_rate": round(rate, 4),
+        "alert": alert,
+    }
+
+    if alert:
+        logger.warning(
+            f"CHURN ALERT: Weekly rate {rate:.1%} exceeds {CHURN_ALERT_THRESHOLD:.0%} threshold — "
+            f"{cancellations} cancellations / {total_subscribers} subscribers."
+        )
+
+    return result
+
+
 def check_phase_triggers():
     """
     Check if phase upgrade conditions are met.
@@ -208,7 +386,6 @@ def check_phase_triggers():
     Phase 3 trigger: $5,000/month gross for 60 days
     """
     conn = get_db()
-    import json
 
     thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
     orders_df = pd.read_sql_query(
@@ -249,12 +426,21 @@ async def run_pipeline():
     await sync_orders(days_back=7)
     await sync_customers(days_back=30)
     await compute_daily_metrics()
+    compute_cohort_metrics()
+    churn_risks = await detect_churn_risks()
+    churn_rate = check_weekly_churn_rate()
     triggers = check_phase_triggers()
+
     if triggers:
         for t in triggers:
             logger.warning(f"TRIGGER: {t}")
+
     logger.info("Pipeline complete.")
-    return triggers
+    return {
+        "triggers": triggers,
+        "churn_risks_flagged": len(churn_risks),
+        "weekly_churn_rate": churn_rate,
+    }
 
 
 if __name__ == "__main__":

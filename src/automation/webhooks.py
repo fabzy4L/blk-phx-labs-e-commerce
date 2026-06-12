@@ -5,39 +5,46 @@ Triggers Klaviyo flows automatically on each event.
 Run: uvicorn src.automation.webhooks:app --host 0.0.0.0 --port 8000
 """
 
+import base64
 import hashlib
 import hmac
 import json
 import logging
 import os
+import sqlite3
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 
 load_dotenv()
 
+from src.store.shopify_client import verify_webhook_signature
 from src.automation.klaviyo_client import track_event, upsert_profile, add_to_list
-from src.ai.support import handle_inquiry
+from src.ai.support import handle_inquiry, generate_product_recommendation
 
 logger = logging.getLogger(__name__)
 app = FastAPI(title="BLK PHX LABS Webhook Server")
 
-SHOPIFY_WEBHOOK_SECRET = os.getenv("SHOPIFY_WEBHOOK_SECRET", "")
 RECHARGE_WEBHOOK_SECRET = os.getenv("RECHARGE_WEBHOOK_SECRET", "")
 TYPEFORM_WEBHOOK_SECRET = os.getenv("TYPEFORM_WEBHOOK_SECRET", "")
+DB_PATH = "blkphx.db"
 
 
 # ── SHOPIFY WEBHOOKS ──────────────────────────────────────────────────────────
 
 @app.post("/webhooks/shopify/orders-paid")
-async def shopify_order_paid(request: Request, x_shopify_hmac_sha256: str = Header(None)):
+async def shopify_order_paid(
+    request: Request,
+    x_shopify_hmac_sha256: str = Header(None),
+):
     """
     Fires when an order is paid.
     → Tracks 'product_purchased' event in Klaviyo
     → Triggers post-purchase education sequence
     """
     body = await request.body()
-    if not _verify_shopify_signature(body, x_shopify_hmac_sha256):
+    if not x_shopify_hmac_sha256 or not verify_webhook_signature(body, x_shopify_hmac_sha256):
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     order = json.loads(body)
@@ -45,8 +52,7 @@ async def shopify_order_paid(request: Request, x_shopify_hmac_sha256: str = Head
     if not email:
         return Response(status_code=200)
 
-    line_items = order.get("line_items", [])
-    products = [item["title"] for item in line_items]
+    products = [item["title"] for item in order.get("line_items", [])]
 
     await track_event(
         event_name="product_purchased",
@@ -68,14 +74,17 @@ async def shopify_order_paid(request: Request, x_shopify_hmac_sha256: str = Head
 
 
 @app.post("/webhooks/shopify/customers-create")
-async def shopify_customer_created(request: Request, x_shopify_hmac_sha256: str = Header(None)):
+async def shopify_customer_created(
+    request: Request,
+    x_shopify_hmac_sha256: str = Header(None),
+):
     """
     Fires on new customer creation.
     → Upserts profile in Klaviyo
     → Adds to main list → triggers welcome sequence
     """
     body = await request.body()
-    if not _verify_shopify_signature(body, x_shopify_hmac_sha256):
+    if not x_shopify_hmac_sha256 or not verify_webhook_signature(body, x_shopify_hmac_sha256):
         raise HTTPException(status_code=401, detail="Invalid signature")
 
     customer = json.loads(body)
@@ -97,16 +106,20 @@ async def shopify_customer_created(request: Request, x_shopify_hmac_sha256: str 
 # ── TYPEFORM QUIZ WEBHOOK ─────────────────────────────────────────────────────
 
 @app.post("/webhooks/typeform/quiz")
-async def typeform_quiz_completed(request: Request):
+async def typeform_quiz_completed(
+    request: Request,
+    typeform_signature: str = Header(None),
+):
     """
     Fires when quiz funnel is completed.
-    → Extracts answers
-    → Tracks 'quiz_completed' event in Klaviyo
+    → Extracts answers → tracks 'quiz_completed' event in Klaviyo
     → Routes to product recommendation flow
     """
     body = await request.body()
-    data = json.loads(body)
+    if not _verify_typeform_signature(body, typeform_signature):
+        raise HTTPException(status_code=401, detail="Invalid signature")
 
+    data = json.loads(body)
     form_response = data.get("form_response", {})
     answers = form_response.get("answers", [])
     hidden = form_response.get("hidden", {})
@@ -117,8 +130,6 @@ async def typeform_quiz_completed(request: Request):
         return Response(status_code=200)
 
     quiz_answers = _parse_typeform_answers(answers)
-
-    from src.ai.support import generate_product_recommendation
     recommendation = generate_product_recommendation(quiz_answers)
 
     await track_event(
@@ -138,11 +149,16 @@ async def typeform_quiz_completed(request: Request):
 # ── RECHARGE WEBHOOKS ─────────────────────────────────────────────────────────
 
 @app.post("/webhooks/recharge/subscription-activated")
-async def recharge_subscription_activated(request: Request):
+async def recharge_subscription_activated(
+    request: Request,
+    x_recharge_hmac_sha256: str = Header(None),
+):
     """Subscription started → trigger onboarding flow in Klaviyo."""
     body = await request.body()
-    data = json.loads(body)
+    if not _verify_recharge_signature(body, x_recharge_hmac_sha256):
+        raise HTTPException(status_code=401, detail="Invalid signature")
 
+    data = json.loads(body)
     subscription = data.get("subscription", {})
     email = subscription.get("email")
     if not email:
@@ -158,33 +174,47 @@ async def recharge_subscription_activated(request: Request):
         },
     )
 
+    _log_subscription_event("subscription_started", email, subscription.get("product_title", ""))
     logger.info(f"Subscription started: {email}")
     return Response(status_code=200)
 
 
 @app.post("/webhooks/recharge/subscription-cancelled")
-async def recharge_subscription_cancelled(request: Request):
+async def recharge_subscription_cancelled(
+    request: Request,
+    x_recharge_hmac_sha256: str = Header(None),
+):
     """
     Subscription cancelled → track event → trigger win-back flow.
-    Also checks if weekly cancellation rate exceeds 5% threshold.
+    Logs to local DB for weekly churn rate computation.
     """
     body = await request.body()
-    data = json.loads(body)
+    if not _verify_recharge_signature(body, x_recharge_hmac_sha256):
+        raise HTTPException(status_code=401, detail="Invalid signature")
 
+    data = json.loads(body)
     subscription = data.get("subscription", {})
     email = subscription.get("email")
     if not email:
         return Response(status_code=200)
+
+    cancellation_reason = subscription.get("cancellation_reason", "not_provided")
 
     await track_event(
         event_name="subscription_cancelled",
         email=email,
         properties={
             "product_title": subscription.get("product_title", ""),
-            "cancellation_reason": subscription.get("cancellation_reason", "not_provided"),
+            "cancellation_reason": cancellation_reason,
         },
     )
 
+    _log_subscription_event(
+        "subscription_cancelled",
+        email,
+        subscription.get("product_title", ""),
+        cancellation_reason,
+    )
     logger.info(f"Subscription cancelled: {email}")
     return Response(status_code=200)
 
@@ -196,18 +226,35 @@ async def health():
     return {"status": "ok", "service": "blkphx-webhooks"}
 
 
-# ── HELPERS ───────────────────────────────────────────────────────────────────
+# ── SIGNATURE VERIFICATION ────────────────────────────────────────────────────
 
-def _verify_shopify_signature(data: bytes, hmac_header: str | None) -> bool:
-    if not hmac_header or not SHOPIFY_WEBHOOK_SECRET:
+def _verify_typeform_signature(data: bytes, sig_header: str | None) -> bool:
+    """
+    Typeform sends HMAC-SHA256 as base64 in the Typeform-Signature header.
+    Format: sha256=<base64_digest>
+    Confirm encoding against your Typeform webhook settings when configuring.
+    """
+    if not sig_header or not TYPEFORM_WEBHOOK_SECRET:
         return False
-    import base64
+    raw_sig = sig_header.removeprefix("sha256=")
     digest = hmac.new(
-        SHOPIFY_WEBHOOK_SECRET.encode("utf-8"), data, hashlib.sha256
+        TYPEFORM_WEBHOOK_SECRET.encode("utf-8"), data, hashlib.sha256
     ).digest()
     computed = base64.b64encode(digest).decode("utf-8")
-    return hmac.compare_digest(computed, hmac_header)
+    return hmac.compare_digest(computed, raw_sig)
 
+
+def _verify_recharge_signature(data: bytes, hmac_header: str | None) -> bool:
+    """Recharge sends HMAC-SHA256 as hexadecimal in X-Recharge-Hmac-Sha256 header."""
+    if not hmac_header or not RECHARGE_WEBHOOK_SECRET:
+        return False
+    digest = hmac.new(
+        RECHARGE_WEBHOOK_SECRET.encode("utf-8"), data, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(digest, hmac_header)
+
+
+# ── HELPERS ───────────────────────────────────────────────────────────────────
 
 def _extract_email_from_answers(answers: list[dict]) -> str | None:
     for answer in answers:
@@ -231,3 +278,35 @@ def _parse_typeform_answers(answers: list[dict]) -> dict:
             choice = answer.get("choice", {})
             result[ref_map[field_ref]] = choice.get("label", choice.get("other", ""))
     return result
+
+
+def _log_subscription_event(
+    event_type: str,
+    email: str,
+    product_title: str,
+    cancellation_reason: str = "",
+) -> None:
+    """Log subscription lifecycle event to local DB for churn rate tracking."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS subscription_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                email TEXT NOT NULL,
+                product_title TEXT,
+                cancellation_reason TEXT,
+                occurred_at TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            """INSERT INTO subscription_events
+               (event_type, email, product_title, cancellation_reason, occurred_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (event_type, email, product_title, cancellation_reason,
+             datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to log subscription event: {e}")

@@ -3,6 +3,7 @@ Shopify API client — orders, products, customers, webhooks.
 All methods async. Handles rate limiting with exponential backoff.
 """
 
+import base64
 import hashlib
 import hmac
 import os
@@ -29,6 +30,7 @@ async def get_orders(
     limit: int = 250,
     since_id: int | None = None,
     created_at_min: str | None = None,
+    created_at_max: str | None = None,
 ) -> list[dict]:
     """Fetch orders with pagination support."""
     params: dict[str, Any] = {"status": status, "limit": limit}
@@ -36,6 +38,8 @@ async def get_orders(
         params["since_id"] = since_id
     if created_at_min:
         params["created_at_min"] = created_at_min
+    if created_at_max:
+        params["created_at_max"] = created_at_max
 
     async with httpx.AsyncClient() as client:
         response = await client.get(
@@ -59,11 +63,17 @@ async def get_products(limit: int = 250) -> list[dict]:
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-async def get_customers(limit: int = 250, since_id: int | None = None) -> list[dict]:
-    """Fetch customers with optional pagination."""
+async def get_customers(
+    limit: int = 250,
+    since_id: int | None = None,
+    updated_at_min: str | None = None,
+) -> list[dict]:
+    """Fetch customers with optional pagination and recency filter."""
     params: dict[str, Any] = {"limit": limit}
     if since_id:
         params["since_id"] = since_id
+    if updated_at_min:
+        params["updated_at_min"] = updated_at_min
 
     async with httpx.AsyncClient() as client:
         response = await client.get(
@@ -78,6 +88,7 @@ async def get_revenue_summary(created_at_min: str, created_at_max: str) -> dict:
     orders = await get_orders(
         status="paid",
         created_at_min=created_at_min,
+        created_at_max=created_at_max,
     )
     total_revenue = sum(float(o["total_price"]) for o in orders)
     total_orders = len(orders)
@@ -93,10 +104,9 @@ async def get_revenue_summary(created_at_min: str, created_at_max: str) -> dict:
 
 
 def verify_webhook_signature(data: bytes, hmac_header: str) -> bool:
-    """Verify Shopify webhook HMAC signature."""
+    """Verify Shopify webhook HMAC-SHA256 signature (base64-encoded)."""
     digest = hmac.new(
         SHOPIFY_WEBHOOK_SECRET.encode("utf-8"), data, hashlib.sha256
     ).digest()
-    import base64
     computed = base64.b64encode(digest).decode("utf-8")
     return hmac.compare_digest(computed, hmac_header)
