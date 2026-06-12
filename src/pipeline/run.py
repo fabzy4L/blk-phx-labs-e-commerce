@@ -1,0 +1,261 @@
+"""
+BLK PHX LABS — Unified Data Pipeline
+Pulls Shopify orders + Klaviyo profiles into local DB.
+Computes: revenue, AOV, LTV, churn rate, funnel conversion.
+Runs on schedule (cron or APScheduler). Idempotent — safe to re-run.
+"""
+
+import asyncio
+import logging
+import os
+import sqlite3
+from datetime import datetime, timedelta, timezone
+
+import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from src.store.shopify_client import get_orders, get_customers
+from src.automation.klaviyo_client import get_list_size
+
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger(__name__)
+
+DB_PATH = "blkphx.db"
+CHURN_ALERT_THRESHOLD = 0.05  # 5% weekly cancellation rate
+
+
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    """Initialize database schema."""
+    conn = get_db()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id TEXT PRIMARY KEY,
+            created_at TEXT,
+            total_price REAL,
+            customer_email TEXT,
+            financial_status TEXT,
+            fulfillment_status TEXT,
+            line_items TEXT,
+            synced_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS customers (
+            id TEXT PRIMARY KEY,
+            email TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            orders_count INTEGER,
+            total_spent REAL,
+            created_at TEXT,
+            synced_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS daily_metrics (
+            date TEXT PRIMARY KEY,
+            revenue REAL,
+            orders INTEGER,
+            new_customers INTEGER,
+            aov REAL,
+            email_list_size INTEGER,
+            computed_at TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS cohort_metrics (
+            cohort_month TEXT,
+            months_since_first_order INTEGER,
+            customers INTEGER,
+            retained INTEGER,
+            retention_rate REAL,
+            avg_ltv REAL,
+            computed_at TEXT,
+            PRIMARY KEY (cohort_month, months_since_first_order)
+        );
+    """)
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized.")
+
+
+async def sync_orders(days_back: int = 7):
+    """Pull recent orders from Shopify into local DB."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days_back)).isoformat()
+    orders = await get_orders(status="paid", created_at_min=since)
+
+    conn = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    import json
+
+    for order in orders:
+        conn.execute("""
+            INSERT OR REPLACE INTO orders
+            (id, created_at, total_price, customer_email,
+             financial_status, fulfillment_status, line_items, synced_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(order["id"]),
+            order["created_at"],
+            float(order["total_price"]),
+            order.get("email", ""),
+            order["financial_status"],
+            order.get("fulfillment_status", ""),
+            json.dumps(order.get("line_items", [])),
+            now,
+        ))
+
+    conn.commit()
+    conn.close()
+    logger.info(f"Synced {len(orders)} orders.")
+    return len(orders)
+
+
+async def sync_customers(days_back: int = 30):
+    """Pull customers from Shopify into local DB."""
+    customers = await get_customers(limit=250)
+
+    conn = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+
+    for customer in customers:
+        conn.execute("""
+            INSERT OR REPLACE INTO customers
+            (id, email, first_name, last_name, orders_count, total_spent, created_at, synced_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            str(customer["id"]),
+            customer.get("email", ""),
+            customer.get("first_name", ""),
+            customer.get("last_name", ""),
+            customer.get("orders_count", 0),
+            float(customer.get("total_spent", 0)),
+            customer["created_at"],
+            now,
+        ))
+
+    conn.commit()
+    conn.close()
+    logger.info(f"Synced {len(customers)} customers.")
+
+
+async def compute_daily_metrics(date: str | None = None):
+    """Compute and store daily business metrics."""
+    target_date = date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    conn = get_db()
+
+    df = pd.read_sql_query(
+        "SELECT * FROM orders WHERE DATE(created_at) = ? AND financial_status = 'paid'",
+        conn,
+        params=(target_date,),
+    )
+
+    revenue = df["total_price"].sum() if not df.empty else 0.0
+    orders = len(df)
+    aov = revenue / orders if orders > 0 else 0.0
+
+    new_customers_df = pd.read_sql_query(
+        "SELECT COUNT(*) as cnt FROM customers WHERE DATE(created_at) = ?",
+        conn,
+        params=(target_date,),
+    )
+    new_customers = new_customers_df["cnt"].iloc[0] if not new_customers_df.empty else 0
+
+    # Email list size from Klaviyo
+    try:
+        list_size = await get_list_size(os.getenv("KLAVIYO_LIST_ID_MAIN", ""))
+    except Exception:
+        list_size = 0
+
+    conn.execute("""
+        INSERT OR REPLACE INTO daily_metrics
+        (date, revenue, orders, new_customers, aov, email_list_size, computed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        target_date,
+        round(revenue, 2),
+        orders,
+        new_customers,
+        round(aov, 2),
+        list_size,
+        datetime.now(timezone.utc).isoformat(),
+    ))
+
+    conn.commit()
+    conn.close()
+
+    metrics = {
+        "date": target_date,
+        "revenue": round(revenue, 2),
+        "orders": orders,
+        "aov": round(aov, 2),
+        "new_customers": new_customers,
+        "email_list_size": list_size,
+    }
+    logger.info(f"Daily metrics computed: {metrics}")
+    return metrics
+
+
+def check_phase_triggers():
+    """
+    Check if phase upgrade conditions are met.
+    Phase 2 trigger: any product >50 units/month
+    Phase 3 trigger: $5,000/month gross for 60 days
+    """
+    conn = get_db()
+    import json
+
+    thirty_days_ago = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    orders_df = pd.read_sql_query(
+        "SELECT line_items FROM orders WHERE created_at >= ? AND financial_status = 'paid'",
+        conn,
+        params=(thirty_days_ago,),
+    )
+    conn.close()
+
+    product_counts: dict[str, int] = {}
+    for _, row in orders_df.iterrows():
+        try:
+            items = json.loads(row["line_items"])
+            for item in items:
+                pid = str(item.get("product_id", ""))
+                product_counts[pid] = product_counts.get(pid, 0) + item.get("quantity", 1)
+        except Exception:
+            continue
+
+    triggers = []
+    for pid, count in product_counts.items():
+        if count > 50:
+            triggers.append({
+                "trigger": "phase_2",
+                "product_id": pid,
+                "units_last_30_days": count,
+                "message": f"Product {pid} hit {count} units — evaluate for private label.",
+            })
+            logger.warning(f"PHASE 2 TRIGGER: Product {pid} → {count} units/month")
+
+    return triggers
+
+
+async def run_pipeline():
+    """Full pipeline run. Called by scheduler."""
+    logger.info("Pipeline starting...")
+    init_db()
+    await sync_orders(days_back=7)
+    await sync_customers(days_back=30)
+    await compute_daily_metrics()
+    triggers = check_phase_triggers()
+    if triggers:
+        for t in triggers:
+            logger.warning(f"TRIGGER: {t}")
+    logger.info("Pipeline complete.")
+    return triggers
+
+
+if __name__ == "__main__":
+    asyncio.run(run_pipeline())

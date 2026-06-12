@@ -1,0 +1,43 @@
+# Environment & secrets
+.env
+.env.local
+credentials/
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Database (local dev only)
+*.db
+*.sqlite
+
+# Streamlit
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+logs/
+
+# Node (if any frontend tooling added)
+node_modules/
+
+# Project archives
+*.zip
