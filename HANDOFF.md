@@ -1,7 +1,46 @@
 # BLK PHX LABS — Engineering Handoff
-**Date:** 2026-06-12
+**Date:** 2026-06-17 (updated)
 **Commit:** `e2ac45e` (main)
-**Status:** Phase 1 code complete. Pending: credentials + deployment.
+**Status:** Phase 1 code complete. Pending: entity formation, logo, service accounts, credentials, deployment.
+
+---
+
+## Session Notes — 2026-06-17
+
+### Broader context (from BLK_PHX_BUILD_PLAN_v2.md)
+This repo is one of three tracks under **BLK PHX, INC.** (Delaware C-Corp — pending formation):
+- **Track 1:** Entity formation (registered agent → C-Corp → EIN → Mercury bank → Bylaws/shares)
+- **Track 2:** Web presence — `blkphx.com` (Framer), `labops.ai` (React + Vercel), this e-commerce store
+- **Track 3:** This repo — e-commerce backend, pending service accounts + deploy
+
+Reference `BLK_PHX_BUILD_PLAN_v2.md` for full timeline, costs, and corporate structure.
+
+### Decisions made
+- **C-Corp confirmed** over LLC. Rationale: LabOps.AI will likely need institutional/VC capital (LLC is a non-starter for that), QSBS Section 1202 protects up to $10M in gains on exit, and the holdco + subsidiaries structure requires it. Double taxation is not a meaningful concern at this stage.
+- **Entity formation is the prerequisite** for everything else — do not open service accounts or sign contracts under a personal name if avoidable.
+
+### Current status by workstream
+| Workstream | Status |
+|---|---|
+| Phase 1 backend code | ✅ Complete (`e2ac45e`) |
+| Logo | 🔄 In progress (on founder's laptop) |
+| Entity formation (C-Corp) | ⬜ Not started |
+| Domains (blkphx.com, blkphxlabs.com, labops.ai) | ⬜ Not started |
+| Service accounts (Shopify, Klaviyo, Recharge, etc.) | ⬜ Not started — no accounts yet |
+| `.env` credentials | ⬜ Blocked on service accounts |
+| Railway deployment | ⬜ Blocked on credentials |
+| blkphx.com (Framer) | ⬜ Not started |
+| labops.ai (React + Vercel) | ⬜ Not started |
+
+### Known code gap
+`recharge_client.py` is listed in the repo layout below but **does not exist** in `src/automation/`. Recharge webhook handlers are in `webhooks.py` but the dedicated sync client module was never created. Flag this before any Recharge integration work.
+
+### Recommended next actions (in order)
+1. Grab domains immediately (before or alongside entity filing — check availability first)
+2. File Delaware C-Corp + get EIN + open Mercury account
+3. Sign Bylaws + issue founder shares → **83(b) election within 30 days**
+4. Open service accounts once entity is formed
+5. Fill `.env`, deploy to Railway, register webhooks
 
 ---
 
@@ -30,7 +69,7 @@ blk-phx-labs-e-commerce/
 │   │   ├── klaviyo_client.py          # Event tracking, profile upsert, list management
 │   │   ├── webhooks.py                # FastAPI webhook server (Shopify/Typeform/Recharge)
 │   │   ├── buffer_client.py           # Social post scheduling via Buffer API
-│   │   └── recharge_client.py         # Recharge subscription sync
+│   │   └── recharge_client.py         # Recharge subscription sync [FILE MISSING — not yet created]
 │   ├── pipeline/
 │   │   └── run.py                     # ETL + cohort metrics + churn detection + phase triggers
 │   ├── scheduler.py                   # APScheduler: daily pipeline + weekly content jobs
