@@ -26,6 +26,9 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+__MACOSX/
+._*
+*.af~lock~
 
 # IDE
 .vscode/
